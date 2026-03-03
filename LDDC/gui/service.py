@@ -17,7 +17,6 @@ import psutil
 from PySide6.QtCore import (
     QCoreApplication,
     QObject,
-    QSharedMemory,
     Qt,
     QThread,
     QTimer,
@@ -135,8 +134,6 @@ class LDDCService(QObject):
         self.q_server = QLocalServer(self)
         self.q_server_name = "LDDCService"
         self.socketserver = None
-        self.shared_memory = QSharedMemory(self)
-        self.shared_memory.setKey("LDDCLOCK")
 
         self.clients: dict[int, Client] = {}
         self.start_service()
@@ -147,88 +144,91 @@ class LDDCService(QObject):
 
         QTimer.singleShot(0, self.init_api)
 
-    def start_service(self) -> None:
+    def _send_message_to_existing_service(self, message: str, timeout: int = 1000) -> str | None:
+        q_client = QLocalSocket(self)
+        q_client.connectToServer(self.q_server_name)
+        if not q_client.waitForConnected(timeout):
+            return None
+        q_client.write(message.encode())
+        q_client.flush()
+        logger.info("发送消息：%s", message)
+        if not q_client.waitForReadyRead(timeout):
+            return None
+        response_data = q_client.readAll().data()
+        if isinstance(response_data, memoryview):
+            response_data = response_data.tobytes()
+        response = response_data.decode()
+        logger.info("收到服务端消息：%s", response)
+        q_client.disconnectFromServer()
+        return response
+
+    def _start_service_in_detached_process(self) -> None:
         if command_line is None:
             msg = "You should start LDDCService by starting the LDDC main program"
             raise RuntimeError(msg)
 
-        if args.get_service_port and not self.shared_memory.attach():
-            cmd = shlex.split(command_line, posix=False)
-            arguments = [re.sub(r'"([^"]+)"', r"\1", arg) for arg in [cmd[0]] + ([*cmd[1:], "--not-show"] if len(cmd) > 1 else ["--not-show"])]
+        cmd = shlex.split(command_line, posix=False)
+        arguments = [re.sub(r'"([^"]+)"', r"\1", arg) for arg in [cmd[0]] + ([*cmd[1:], "--not-show"] if len(cmd) > 1 else ["--not-show"])]
 
-            # 注意在调试模式下无法新建一个独立进程
-            logger.info("在独立进程中启动LDDC服务,  命令行参数：%s", arguments)
-            subprocess.Popen(
-                arguments,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                close_fds=True,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-            )
+        # 注意在调试模式下无法新建一个独立进程
+        logger.info("在独立进程中启动LDDC服务,  命令行参数：%s", arguments)
+        subprocess.Popen(
+            arguments,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+        )
 
-            wait_time = 0
-            while not self.shared_memory.attach():
-                time.sleep(0.05)
-                wait_time += 0.05
-                if wait_time > 5:
-                    logger.error("LDDC服务启动失败")
+    def start_service(self) -> None:
+        if args.get_service_port:
+            response = self._send_message_to_existing_service("get_service_port")
+            if response is None:
+                self._start_service_in_detached_process()
+                wait_time = 0.0
+                while response is None:
+                    time.sleep(0.05)
+                    wait_time += 0.05
+                    response = self._send_message_to_existing_service("get_service_port", timeout=200)
+                    if wait_time > 5:
+                        logger.error("LDDC服务启动失败")
+                        sys.exit(1)
+                logger.info("LDDC服务启动成功")
+            print(response)  # noqa: T201
+            sys.exit(0)
+
+        if not self.q_server.listen(self.q_server_name):
+            # 清理异常退出后残留的本地服务端记录
+            QLocalServer.removeServer(self.q_server_name)
+            if not self.q_server.listen(self.q_server_name):
+                logger.info("LDDC服务已经启动")
+                if args.show is False:
+                    sys.exit(0)
+                if self._send_message_to_existing_service("show") is None:
+                    logger.error("LDDC服务连接失败")
                     sys.exit(1)
-            logger.info("LDDC服务启动成功")
-
-        if self.shared_memory.attach() or not self.shared_memory.create(1):
-            # 说明已经有其他LDDC服务启动
-            logger.info("LDDC服务已经启动")
-            q_client = QLocalSocket()
-            q_client.connectToServer(self.q_server_name)
-            if not q_client.waitForConnected(1000):
-                logger.error("LDDC服务连接失败")
-                sys.exit(1)
-            if args.get_service_port:
-                message = "get_service_port"
-            elif args.show is False:
+                self.q_server.close()
                 sys.exit(0)
-            else:
-                message = "show"
-            q_client.write(message.encode())
-            q_client.flush()
-            logger.info("发送消息：%s", message)
-            if q_client.waitForReadyRead(1000):
-                response_data = q_client.readAll().data()
-                if isinstance(response_data, memoryview):
-                    response_data = response_data.tobytes()
-                response = response_data.decode()
-                logger.info("收到服务端消息：%s", response)
-                if args.get_service_port:
-                    print(response)  # 输出服务端监听的端口  # noqa: T201
-                    sys.exit(0)
-                else:
-                    self.q_server.close()
-                    sys.exit(0)
-            else:
-                logger.error("LDDC服务连接失败")
-                sys.exit(1)
-        else:
-            self.q_server.listen(self.q_server_name)
-            # 找到一个可用的端口
-            self.socketserver = QTcpServer(self)
-            while True:
-                port = random.randint(10000, 65535)  # 随机生成一个端口
-                if self.socketserver.listen(QHostAddress("127.0.0.1"), port):
-                    self.socket_port = port
-                    break
-                logger.error("端口%s被占用", port)
+        # 找到一个可用的端口
+        self.socketserver = QTcpServer(self)
+        while True:
+            port = random.randint(10000, 65535)  # 随机生成一个端口
+            if self.socketserver.listen(QHostAddress("127.0.0.1"), port):
+                self.socket_port = port
+                break
+            logger.error("端口%s被占用", port)
 
-            logger.info("LDDC服务启动成功, 端口: %s", self.socket_port)
-            self.q_server.newConnection.connect(self.on_q_server_new_connection)
-            self.socketserver.newConnection.connect(self.socket_on_new_connection)
+        logger.info("LDDC服务启动成功, 端口: %s", self.socket_port)
+        self.q_server.newConnection.connect(self.on_q_server_new_connection)
+        self.socketserver.newConnection.connect(self.socket_on_new_connection)
 
-            self.check_any_instance_alive_timer = QTimer(self)
-            self.check_any_instance_alive_timer.timeout.connect(self._clean_dead_instance)
-            self.check_any_instance_alive_timer.start(1000)
-            self.instance_finished.connect(self.del_instance)
+        self.check_any_instance_alive_timer = QTimer(self)
+        self.check_any_instance_alive_timer.timeout.connect(self._clean_dead_instance)
+        self.check_any_instance_alive_timer.start(1000)
+        self.instance_finished.connect(self.del_instance)
 
-            self.send_msg.connect(self.socket_send_message)
+        self.send_msg.connect(self.socket_send_message)
 
     def init_api(self) -> None:
         from LDDC.core.api.lyrics import lyrics_api
@@ -241,7 +241,6 @@ class LDDCService(QObject):
         self.q_server.close()
         if self.socketserver:
             self.socketserver.close()
-        self.shared_memory.detach()
         self.check_any_instance_alive_timer.stop()
         logger.info("LDDC服务停止完成")
 
